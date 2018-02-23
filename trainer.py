@@ -1,0 +1,282 @@
+import torch
+from torch.autograd import Variable
+import torch.nn as nn
+import torch.nn.functional as F
+from torch import optim
+import os
+import time
+from datetime import datetime
+
+class EMA():
+    def __init__(self, mu):
+        self.mu = mu
+        self.shadow = {}
+
+    def register(self, name, val):
+        self.shadow[name] = val.clone()
+
+    def __call__(self, name, x):
+        assert name in self.shadow
+        new_average = self.mu * x + (1.0 - self.mu) * self.shadow[name]
+        self.shadow[name] = new_average.clone()
+        return new_average
+
+
+
+
+def accuracy(logit, target):
+    y_oh = torch.zeros(logit.size())
+    y_oh.scatter_(1, target[:, None], 1)
+
+    #l_oh = torch.eq(
+    #    logit, logit.max(1)[0].expand(len(logit), len(logit[0]))
+    #).type_as(y_oh)
+
+    l_oh = torch.zeros(logit.size())
+    l_oh.scatter_(1, logit.max(1)[1][:, None].cpu(), 1)
+
+    conf_mat = y_oh.t_().mm(l_oh)
+    ref_sum = conf_mat.sum(0).squeeze()
+    pred_sum = conf_mat.sum(1).squeeze()
+
+    F1 = conf_mat.diag() * 2 / (ref_sum + pred_sum + 1e-9)
+    F1 = torch.cat([F1[None, :], F1[None, :].mean(dim=1)[None]], dim=1)
+
+    return F1
+
+
+def ema_list(series, alpha=0.001):
+    res = [series[0]]
+    x = res[-1]
+    for t in series[1:]:
+        x = x + (t - x) * alpha
+        res.append(x)
+
+    return torch.cat(res)
+
+
+def evaluate(net, test_producer, gpu_id):
+    net.eval()
+    for i, data in enumerate(test_producer, 1):
+
+
+        input = data['x']
+        if not isinstance(input, dict):
+            input = Variable(data['x'].cuda(gpu_id))
+        else:
+            for k, v in input.items():
+                input[k] = Variable(v.cuda(gpu_id))
+
+        label = data['y']
+        outputs = net(input)
+        if i == 1:
+            acc_sum = accuracy(outputs.data, label)
+        else:
+            acc_sum += accuracy(outputs.data, label)
+
+    acc = acc_sum / i
+    return acc
+
+def make_dir(save_path):
+    trial = 0
+    while True:
+        trial += 1
+        path = save_path + ('/%04d' % trial)
+        if not os.path.exists(path):
+            break
+    os.makedirs(path)
+    print('Created empty directory at:', os.path.abspath(path))
+    return path
+
+def load_latest(save_path):
+    trial = 1
+    while os.path.exists(save_path + ('/%04d' % (trial+1))):
+        trial += 1
+    path = save_path + ('/%04d' % trial)
+    print('Using latest training at:', os.path.abspath(path))
+    return path
+
+class Trainer:
+    def __init__(self, path, class_weight, dryrun=False):
+
+        self.dryrun = dryrun
+        if dryrun:
+            path = 'dry/' + path
+        self.class_weight = torch.FloatTensor(class_weight)
+        self.path = make_dir(path)
+        self.name = path
+        assert os.path.exists(self.path)
+        self.losses = []
+        self.train_F1 = []
+        self.test_F1 = []
+        self.test_highscore = 0
+        self.highscore_epoch = 1
+
+    def train(self, net, train_producer, test_producer, epochs=420,
+              lr_dict={1:1e-4, 100:5e-5, 200:1e-5},
+              gpu_id=None, useAdam=True, log2file=True):
+
+        log = None
+        if not self.dryrun and log2file:
+            log = open(self.path+'/log', 'w')
+
+        net.cuda(gpu_id)
+        criterion = nn.CrossEntropyLoss(self.class_weight.cuda(gpu_id))
+        epoch_t_sum = 0
+        if useAdam:
+            learning_rate = 1e-4
+        else:
+            learning_rate = 1e-2
+
+        '''
+        if self.restore:
+            net.load_state_dict(th.load(self.path+'/state_dict_highscore'))
+            highscore_str = '%.4f @ %05d epoch' % (self.test_highscore, self.highscore_epoch)
+            print('RESTORED: ', datetime.now(),
+                  'from last highscore:', highscore_str, file=log)
+            print('RESTORED: ', datetime.now(),
+                  'from last highscore:', highscore_str)
+        '''
+        last_update_epoch = 0
+        for epoch in range(self.highscore_epoch, epochs+1):
+            if lr_dict.get(epoch) is not None:
+                learning_rate = lr_dict[epoch]
+                print('#### NEW LEARNING RATE %e ####' % learning_rate, file=log, flush=True)
+            if useAdam:
+                optimizer = optim.Adam(net.parameters(), learning_rate,
+                                       weight_decay=0.0005)
+            else:
+                optimizer = optim.SGD(net.parameters(), learning_rate,
+                                      weight_decay=0.0005, momentum=.9)
+            acc_sum = 0
+            net.train()
+            epoch_start = time.time()
+            for i, data in enumerate(train_producer, 1):
+                start_t = time.time()
+
+                optimizer.zero_grad()
+                input = data['x']
+                if not isinstance(input, dict):
+                    input = Variable(data['x'].cuda(gpu_id))
+                else:
+                    for k, v in input.items():
+                        input[k] = Variable(v.cuda(gpu_id))
+
+                label = Variable(data['y'].cuda(gpu_id))
+                outputs = net.forward(input)
+                inference_t = time.time() - start_t
+                loss = criterion(outputs, label)
+                loss.backward()
+                optimizer.step()
+
+                update_t = time.time() - start_t
+                self.losses.append(loss.data.tolist()[0])
+
+                self.train_F1.append(
+                    accuracy(outputs.data, data['y']))
+                acc_sum += self.train_F1[-1]
+                if i % (len(train_producer) // 20) == 0:
+                    stat = epoch, i, self.losses[-1], outputs.size()[0]/update_t
+                    print('[%4d, %3d] loss: %5.4f\tsample/sec: %4.1f' % stat,
+                    file=log, flush=True)
+
+
+            if self.path and epoch % (epochs // 2) == 0:
+                torch.save(net.state_dict(), self.path+'/state_dict')
+
+            torch.save(self, self.path + '/' +'trainer')
+
+            log_string = 'Train acc (F1):\n'
+            log_vals = (acc_sum/i).tolist()[0]
+            for i, val in enumerate(log_vals[:-1]):
+                log_string += 'Class%1d: %.4f  ' % (i, val)
+            log_string += 'mean: %.4f' % log_vals[-1]
+            print(log_string, file=log, flush=True)
+
+            test_acc = evaluate(net, test_producer, gpu_id)
+            if test_acc.tolist()[0][-1] > self.test_highscore:
+                self.test_highscore = test_acc.tolist()[0][-1]
+                self.highscore_epoch = epoch
+                with open(self.path+'/result', 'w') as f:
+                    f.write('%70s %.4f @ %05d | curr: %05d\n'%(
+                        self.name,
+                        self.test_highscore,
+                        self.highscore_epoch,
+                        epoch))
+                print('<<<< %.4f @ %05d epoch >>>>' % (
+                    self.test_highscore, self.highscore_epoch), file=log)
+                torch.save(net.state_dict(), self.path+'/state_dict_highscore')
+
+            log_string = 'Test acc (F1):\n'
+            log_vals = test_acc.tolist()[0]
+            for i, val in enumerate(log_vals[:-1]):
+                log_string += 'Class%1d: %.4f  ' % (i, val)
+            log_string += 'mean: %.4f' % log_vals[-1]
+            print(log_string, file=log, flush=True)
+
+            self.test_F1.append(test_acc)
+
+            epoch_t_sum += time.time() - epoch_start
+            epoch_time = epoch_t_sum / 60 / epoch
+            ETL = (epochs - epoch) * epoch_time
+            print('\nepoch time: %10.2f min' % epoch_time, file=log)
+            print('     total: %10.2f min' % (epoch_t_sum/60), file=log)
+            print(' est. left: %10.2f min' % ETL, file=log)
+            print('-' * 40, file=log)
+
+        print('Finished training!\n  Total time: %10.2f'%(epoch_t_sum/60), file=log)
+        print('  Highscore %.4f @ %05d epoch' % (self.test_highscore, self.highscore_epoch), file=log)
+        if log2file:
+            print('Finished training!\n  Total time: %10.2f'%(epoch_t_sum/60))
+            print('  Highscore: %.4f @ %05d epoch' % (self.test_highscore, self.highscore_epoch))
+            if not dryrun:
+                log.close()
+        return self.losses, self.train_F1, self.test_F1
+
+    def plot(self, ema_loss=.1, ema_train_f1=.1, ema_test_f1=.8, filename=None):
+        import matplotlib.pyplot as plt
+
+        losses = self.losses
+        F1 = self.train_F1
+        test_F1 = self.test_F1
+        fig1 = plt.figure()
+        #plt.subplot(3, 1, 1)
+        plt.plot(ema_list(losses, ema_loss))
+        plt.title('Train Loss')
+
+        #plt.subplot(3, 1, 2)
+        fig2 = plt.figure()
+        alpha = ema_train_f1
+        if len(self.class_weight) == 3:
+            plt.plot(ema_list(th.cat(F1)[:, 0], alpha), label='N')
+            plt.plot(ema_list(th.cat(F1)[:, 1], alpha), label='A')
+            plt.plot(ema_list(th.cat(F1)[:, 2], alpha), label='O')
+        #plt.plot(ema_list(th.cat(F1)[:, 3], alpha), label='~')
+        elif len(self.class_weight) == 2:
+            plt.plot(ema_list(th.cat(F1)[:, 0], alpha), label='Class1')
+            plt.plot(ema_list(th.cat(F1)[:, 1], alpha), label='Class2')
+        plt.plot(ema_list(th.cat(F1)[:, -1], alpha), label='Mean')
+        plt.title('Train Accuracy')
+        plt.legend(loc='lower right')
+
+        #plt.subplot(3, 1, 3)
+        fig3 = plt.figure()
+        alpha = ema_test_f1
+
+        if len(self.class_weight) == 3:
+            plt.plot(ema_list(th.cat(test_F1)[:, 0], alpha), label='N')
+            plt.plot(ema_list(th.cat(test_F1)[:, 1], alpha), label='A')
+            plt.plot(ema_list(th.cat(test_F1)[:, 2], alpha), label='O')
+        #plt.plot(ema_list(th.cat(F1)[:, 3], alpha), label='~')
+        elif len(self.class_weight) == 2:
+            plt.plot(ema_list(th.cat(test_F1)[:, 0], alpha), label='Class1')
+            plt.plot(ema_list(th.cat(test_F1)[:, 1], alpha), label='Class2')
+
+        plt.title('Test Accuracy')
+        plt.legend(loc='lower right')
+        if filename is not None:
+            fig3.savefig(filename+'test.png')
+        return fig1, fig2, fig3
+
+    def __call__(self, *args, **kwargs):
+        self.train(*args, **kwargs)
